@@ -20,6 +20,8 @@ import obmc.mapper
 import obmc.utils.dtree
 import obmc.utils.pathtree
 import dbus
+import dbus.mainloop.glib
+import gobject
 import os
 import subprocess
 import tempfile
@@ -46,6 +48,13 @@ def transform(path, o):
         rename = name
         revalue = value
 
+        # convert to lower case
+        rename = rename.lower()
+
+        # force name to be a string
+        if rename == 'name' and isinstance(revalue, list):
+            revalue = ''.join([str(x) for x in revalue])
+
         # make is-fru a real boolean
         if rename == 'is_fru':
             revalue = 'True' if revalue == 1 else 'False'
@@ -53,9 +62,6 @@ def transform(path, o):
         # swap underscore/space for dash in property name
         rename = rename.replace('_', '-')
         rename = rename.replace(' ', '-')
-
-        # convert to lower case
-        rename = rename.lower()
 
         # strip trailing whitespace from strings
         rename = rename.rstrip()
@@ -77,39 +83,67 @@ def transform(path, o):
     return path, o
 
 
-if __name__ == '__main__':
-    bus = dbus.SystemBus()
-    objs = obmc.utils.pathtree.PathTree()
+class InventoryUpload(object):
+    def __init__(self, bus):
+        self.bus = bus
+        self.bus.add_signal_receiver(
+            self.state_handler,
+            dbus_interface='org.openbmc.Control',
+            signal_name='GotoSystemState')
+        self.bus.add_signal_receiver(
+            self.bus_handler,
+            dbus_interface=dbus.BUS_DAEMON_IFACE,
+            signal_name='NameOwnerChanged')
 
-    mapper = obmc.mapper.Mapper(bus)
-    for path, props in \
-            mapper.enumerate_subtree(
-                path='/org/openbmc/inventory/system').iteritems():
-        item = transform(path, props)
-        if item:
-            objs[item[0]] = item[1]
+    def bus_handler(self, name, old, new):
+        if name == 'org.openbmc.Inventory' and new:
+            self.upload()
 
-    rpipe, wpipe = os.pipe()
-    rpipe = os.fdopen(rpipe, 'r')
-    wpipe = os.fdopen(wpipe, 'a')
+    def state_handler(self, state):
+        if state == 'HOST_POWERED_OFF':
+            self.upload()
 
-    wpipe.write('/dts-v1/;')
-    obmc.utils.dtree.dts_encode(objs.dumpd(), wpipe)
-    wpipe.close()
-    h, tmpfile = tempfile.mkstemp()
-    try:
-        wfile = os.fdopen(h, 'w')
-        subprocess.call(
-            ['dtc', '-O', 'dtb'],
-            stdin=rpipe,
-            stdout=wfile)
-        rpipe.close()
-        wfile.close()
+    def upload(self):
+        objs = obmc.utils.pathtree.PathTree()
 
-        print "Uploading inventory to PNOR in dtb format..."
-        subprocess.call(['pflash', '-f', '-e', '-p', tmpfile, '-P', 'BMC_INV'])
-    except:
+        mapper = obmc.mapper.Mapper(self.bus)
+        for path, props in \
+                mapper.enumerate_subtree(
+                    path='/org/openbmc/inventory/system').iteritems():
+            item = transform(path, props)
+            if item:
+                objs[item[0]] = item[1]
+
+        rpipe, wpipe = os.pipe()
+        rpipe = os.fdopen(rpipe, 'r')
+        wpipe = os.fdopen(wpipe, 'a')
+
+        wpipe.write('/dts-v1/;')
+        obmc.utils.dtree.dts_encode(objs.dumpd(), wpipe)
+        wpipe.close()
+        h, tmpfile = tempfile.mkstemp()
+        try:
+            wfile = os.fdopen(h, 'w')
+            subprocess.call(
+                ['dtc', '-f', '-O', 'dtb'],
+                stdin=rpipe,
+                stdout=wfile)
+            rpipe.close()
+            wfile.close()
+
+            print "Uploading inventory to PNOR in dtb format..."
+            subprocess.call(
+                ['pflash', '-f', '-e', '-p', tmpfile, '-P', 'BMC_INV'])
+        except:
+            os.remove(tmpfile)
+            raise
+
         os.remove(tmpfile)
-        raise
 
-    os.remove(tmpfile)
+if __name__ == '__main__':
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    loop = gobject.MainLoop()
+    bus = dbus.SystemBus()
+    uploader = InventoryUpload(bus)
+
+    loop.run()
