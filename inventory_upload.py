@@ -112,7 +112,7 @@ if __name__ == '__main__':
 
         print "Uploading inventory to PNOR in dtb format..."
         subprocess.call(['pflash', '-f', '-e', '-p', tmpfile, '-P', 'BMC_INV'])
-    except:
+    except Exception:
         os.remove(tmpfile)
         raise
 
